@@ -1,0 +1,268 @@
+# Packaging workflow for the PUBLIC distribution repository stunor92/origo-releases.
+#
+# This file is the source of truth and is reviewed and tested here (see
+# .github/workflows/test-release-desktop.sh), but it RUNS in origo-releases and
+# must be copied to .github/workflows/package-desktop.yml there. Changing it here
+# without copying it over changes nothing about how installers are actually built.
+#
+# It receives an already-built executable JAR plus the packaging scripts from the
+# private repository's stage-desktop-release job, wraps them into a dmg/msi/deb on
+# each host, signs and notarises the macOS build, then generates and signs the
+# update manifest the installed desktop app reads.
+name: Package desktop installers
+
+on:
+  repository_dispatch:
+    types: [package-desktop]
+  # Manual re-run for a tag whose staging assets are still on the draft release,
+  # e.g. after a transient notarisation failure.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package (e.g. v8.34.0)
+        required: true
+      version:
+        description: Version without the leading v (e.g. 8.34.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+  VERSION: ${{ github.event.client_payload.version || inputs.version }}
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            type: dmg
+          - os: ubuntu-24.04
+            type: deb
+          - os: windows-latest
+            type: msi
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # Staged by the private repository onto this release while it is still a
+      # draft, so these inputs are not publicly downloadable and are removed
+      # again before the release is published.
+      - name: Download staged build inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          gh release download "$TAG" \
+            --dir staging \
+            --pattern 'desktopApp-jvm-executable.jar' \
+            --pattern 'desktop-packaging.tar.gz'
+
+      - name: Unpack the packaging scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The scripts resolve paths relative to their own directory, so the
+          # archive's desktopApp/... layout has to land at the workspace root.
+          tar -xzf staging/desktop-packaging.tar.gz
+          mkdir -p build/desktop-jar
+          # jpackage passes the JAR's whole parent directory as --input, so this
+          # directory must hold the JAR and nothing else.
+          mv staging/desktopApp-jvm-executable.jar build/desktop-jar/
+
+      - name: Prepare macOS signing credentials
+        if: ${{ matrix.type == 'dmg' }}
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          MACOS_CERTIFICATE_PATH: ${{ runner.temp }}/origo-developer-id.p12
+          MACOS_KEYCHAIN_PATH: ${{ runner.temp }}/origo-signing.keychain-db
+          APPLE_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+        run: |
+          set -euo pipefail
+          umask 077
+
+          required=(
+            MACOS_CERTIFICATE_P12
+            MACOS_CERTIFICATE_PASSWORD
+            MACOS_SIGNING_IDENTITY
+            APPLE_TEAM_ID
+            APPLE_NOTARY_KEY_ID
+            APPLE_NOTARY_PRIVATE_KEY
+            APPLE_NOTARY_ISSUER_ID
+          )
+          for variable in "${required[@]}"; do
+            if [ -z "${!variable:-}" ]; then
+              echo "${variable} GitHub secret is required for signed macOS releases."
+              exit 1
+            fi
+          done
+
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 -D > "$MACOS_CERTIFICATE_PATH"
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" > "$APPLE_NOTARY_KEY_PATH"
+
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$MACOS_KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$MACOS_KEYCHAIN_PATH"
+          security unlock-keychain -p "$keychain_password" "$MACOS_KEYCHAIN_PATH"
+          security list-keychains -d user -s "$MACOS_KEYCHAIN_PATH"
+          security import "$MACOS_CERTIFICATE_PATH" \
+            -k "$MACOS_KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$MACOS_KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" \
+            | grep -F "$MACOS_SIGNING_IDENTITY" >/dev/null
+          security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" \
+            | grep -F "($APPLE_TEAM_ID)" >/dev/null
+
+      - name: Build installer
+        shell: bash
+        env:
+          DESKTOP_SKIP_BUILD: '1'
+          # Point the packaging scripts at the downloaded JAR instead of the
+          # build output tree this runner never produced.
+          DESKTOP_BUILD_DIR: ${{ github.workspace }}/build/desktop-jar
+          DESKTOP_RELEASE_IMAGE: ${{ matrix.type == 'dmg' && '1' || '' }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.type }}" = "msi" ]; then
+            pwsh -File desktopApp/package/package-desktop.ps1 -Type msi
+          elif [ "${{ matrix.type }}" = "dmg" ]; then
+            desktop_jars=()
+            while IFS= read -r desktop_jar; do desktop_jars+=("$desktop_jar"); done \
+              < <(find "$DESKTOP_BUILD_DIR" -name 'desktopApp-jvm-executable.jar' -type f -print)
+            if [ "${#desktop_jars[@]}" -ne 1 ]; then
+              echo "Expected exactly one executable desktop JAR, found ${#desktop_jars[@]}."
+              exit 1
+            fi
+            desktop_jar="${desktop_jars[0]}"
+            bash desktopApp/package/sign-embedded-macos-libs.sh "$desktop_jar"
+            bash desktopApp/package/package-desktop.sh image
+            bash desktopApp/package/sign-notarize-macos.sh
+          else
+            bash desktopApp/package/package-desktop.sh "${{ matrix.type }}"
+          fi
+
+      - name: Clean up macOS signing credentials
+        if: ${{ always() && matrix.type == 'dmg' }}
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_PATH: ${{ runner.temp }}/origo-developer-id.p12
+          MACOS_KEYCHAIN_PATH: ${{ runner.temp }}/origo-signing.keychain-db
+          APPLE_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+        run: |
+          security delete-keychain "$MACOS_KEYCHAIN_PATH" 2>/dev/null || true
+          rm -f "$MACOS_CERTIFICATE_PATH" "$APPLE_NOTARY_KEY_PATH"
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd desktopApp/build/packages
+          for f in *.dmg *.deb *.msi; do
+            if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" > "$f.sha256"; else shasum -a 256 "$f" > "$f.sha256"; fi
+          done
+
+      - name: Upload installers to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd desktopApp/build/packages
+          files=( *.dmg *.deb *.msi *.sha256 )
+          gh release upload "$TAG" "${files[@]}" --clobber
+
+  # Runs only after every installer is on the release, so the manifest can never
+  # advertise a platform whose build failed.
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p packages
+          gh release download "$TAG" --dir packages \
+            --pattern '*.dmg' --pattern '*.msi' --pattern '*.deb' --pattern '*.sha256'
+          gh release download "$TAG" --dir . \
+            --pattern 'desktop-packaging.tar.gz' --pattern 'update-public-key.txt'
+          tar -xzf desktop-packaging.tar.gz
+
+      - name: Generate the update manifest
+        shell: bash
+        env:
+          MANIFEST_REPO: ${{ github.repository }}
+          MANIFEST_RELEASE_NOTES_URL: ${{ github.event.client_payload.release_notes_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p manifest
+          MANIFEST_VERSION="$VERSION" MANIFEST_TAG="$TAG" \
+            bash desktopApp/package/generate-manifest.sh packages manifest/latest.json
+          cat manifest/latest.json
+
+      - name: Sign the update manifest
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          # Pinned to the key the shipped app verifies with, so a wrong signing
+          # key fails the release instead of silently killing the update channel.
+          UPDATE_EXPECTED_PUBLIC_KEY="$(cat update-public-key.txt)" \
+            bash desktopApp/package/sign-manifest.sh \
+              manifest/latest.json manifest/latest.json.sig
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            manifest/latest.json manifest/latest.json.sig --clobber
+
+          # Build inputs are not part of the distribution. Removing them before
+          # publishing keeps the release to installers, checksums and manifest.
+          for asset in desktopApp-jvm-executable.jar desktop-packaging.tar.gz update-public-key.txt; do
+            gh release delete-asset "$TAG" "$asset" --yes || true
+          done
+
+          # Publishing is what makes releases/latest/download/latest.json resolve
+          # here, so it happens last — after the manifest it will serve exists.
+          gh release edit "$TAG" --draft=false --latest
