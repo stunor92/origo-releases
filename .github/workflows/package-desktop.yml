@@ -227,7 +227,11 @@ jobs:
         shell: bash
         env:
           MANIFEST_REPO: ${{ github.repository }}
-          MANIFEST_RELEASE_NOTES_URL: ${{ github.event.client_payload.release_notes_url }}
+          # Left unset so generate-manifest.sh defaults to this repository's
+          # release page. The update banner opens this link when a background
+          # install fails, so it must reach somewhere the user can actually
+          # download from.
+          MANIFEST_RELEASE_NOTES_URL: ''
         run: |
           set -euo pipefail
           mkdir -p manifest
