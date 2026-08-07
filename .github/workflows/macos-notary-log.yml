@@ -1,0 +1,66 @@
+# Fetch Apple's detailed notarisation log for a single submission.
+#
+# When notarisation fails, notarytool reports only a status (Invalid, Rejected).
+# The reasons — an unsigned nested library, a missing entitlement, the specific
+# binary at fault — live in a separate log fetched by submission ID.
+# sign-notarize-macos.sh tries to fetch it inline when a release fails, but that
+# is best-effort and only at that moment; this retrieves the log for any
+# submission afterwards, without re-running a release.
+#
+# The submission ID comes from the packaging run: sign-notarize-macos.sh prints
+# the full notarytool JSON, and its `id` field is the value to pass here.
+name: macOS notarisation log
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: Apple notarytool submission ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notary-log:
+    runs-on: macos-14
+    steps:
+      - name: Prepare App Store Connect API key
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+        run: |
+          set -euo pipefail
+          umask 077
+          for variable in APPLE_NOTARY_KEY_ID APPLE_NOTARY_PRIVATE_KEY APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!variable:-}" ]; then
+              echo "${variable} GitHub secret is required."
+              exit 1
+            fi
+          done
+          printf '%s' "$APPLE_NOTARY_PRIVATE_KEY" > "$APPLE_NOTARY_KEY_PATH"
+
+      - name: Fetch Apple notarisation log
+        shell: bash
+        env:
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+        run: |
+          set -euo pipefail
+          xcrun notarytool log "$SUBMISSION_ID" \
+            --key "$APPLE_NOTARY_KEY_PATH" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID"
+
+      - name: Clean up API key
+        if: ${{ always() }}
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_NOTARY_KEY_ID }}.p8
+        run: rm -f "$APPLE_NOTARY_KEY_PATH"
