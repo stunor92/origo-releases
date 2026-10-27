@@ -41,7 +41,7 @@ jobs:
           - os: macos-14
             type: dmg
           - os: ubuntu-24.04
-            type: deb
+            type: appimage
           - os: windows-latest
             type: msi
     runs-on: ${{ matrix.os }}
@@ -138,6 +138,33 @@ jobs:
           security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" \
             | grep -F "($APPLE_TEAM_ID)" >/dev/null
 
+      # Both pinned by version and checksum. Without --runtime-file appimagetool
+      # downloads whatever runtime is newest, and that runtime is the code every
+      # AppImage starts with.
+      - name: Fetch appimagetool and the AppImage runtime
+        if: ${{ matrix.type == 'appimage' }}
+        shell: bash
+        env:
+          APPIMAGETOOL_VERSION: '1.9.1'
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          APPIMAGE_RUNTIME_VERSION: '20251108'
+          APPIMAGE_RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/appimage-tools"
+          mkdir -p "$tools"
+          curl -fsSL -o "$tools/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          curl -fsSL -o "$tools/runtime-x86_64" \
+            "https://github.com/AppImage/type2-runtime/releases/download/$APPIMAGE_RUNTIME_VERSION/runtime-x86_64"
+          printf '%s  %s\n' \
+            "$APPIMAGETOOL_SHA256" "$tools/appimagetool" \
+            "$APPIMAGE_RUNTIME_SHA256" "$tools/runtime-x86_64" \
+            | sha256sum --check --strict
+          chmod +x "$tools/appimagetool"
+          echo "APPIMAGETOOL=$tools/appimagetool" >> "$GITHUB_ENV"
+          echo "APPIMAGE_RUNTIME=$tools/runtime-x86_64" >> "$GITHUB_ENV"
+
       - name: Build installer
         shell: bash
         env:
@@ -181,13 +208,23 @@ jobs:
           security delete-keychain "$MACOS_KEYCHAIN_PATH" 2>/dev/null || true
           rm -f "$MACOS_CERTIFICATE_PATH" "$APPLE_NOTARY_KEY_PATH"
 
+      # The web site links at releases/latest/download/<name>, so the file names
+      # must not carry the version. Before the checksums, so each .sha256 names
+      # the file that is actually published.
+      - name: Normalise installer names
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash desktopApp/package/normalise-installer-names.sh \
+            desktopApp/build/packages "$VERSION"
+
       - name: Checksums
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
           cd desktopApp/build/packages
-          for f in *.dmg *.deb *.msi; do
+          for f in *.dmg *.msi *.AppImage; do
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" > "$f.sha256"; else shasum -a 256 "$f" > "$f.sha256"; fi
           done
 
@@ -200,7 +237,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           cd desktopApp/build/packages
-          files=( *.dmg *.deb *.msi *.sha256 )
+          files=( *.dmg *.msi *.AppImage *.sha256 )
           gh release upload "$TAG" "${files[@]}" --clobber
 
   # Runs only after every installer is on the release, so the manifest can never
@@ -218,7 +255,8 @@ jobs:
           set -euo pipefail
           mkdir -p packages
           gh release download "$TAG" --dir packages \
-            --pattern '*.dmg' --pattern '*.msi' --pattern '*.deb' --pattern '*.sha256'
+            --pattern '*.dmg' --pattern '*.msi' --pattern '*.AppImage' \
+            --pattern '*.sha256'
           gh release download "$TAG" --dir . \
             --pattern 'desktop-packaging.tar.gz' --pattern 'update-public-key.txt'
           tar -xzf desktop-packaging.tar.gz
@@ -270,3 +308,4 @@ jobs:
           # Publishing is what makes releases/latest/download/latest.json resolve
           # here, so it happens last — after the manifest it will serve exists.
           gh release edit "$TAG" --draft=false --latest
+
